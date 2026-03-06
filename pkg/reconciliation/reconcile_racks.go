@@ -495,6 +495,50 @@ func (rc *ReconciliationContext) CheckRackPodTemplateDetails(force bool, failedR
 		}
 
 		if !utils.ResourcesHaveSameHash(statefulSet, desiredSts) && (force || rc.UpdateAllowed()) {
+			// Cross-DC rack-aware rollout coordination.
+			//
+			// This check lives inside the "needs update" block intentionally:
+			// racks whose STS hash already matches the desired state must fall
+			// through without hitting the cluster-wide check, otherwise an
+			// already-completed rack would see a *different* rack rolling and
+			// block the entire loop from ever reaching the rack that actually
+			// needs work.
+			//
+			// The directional comparison (rollingIdx < idx) is a resilience
+			// measure for recovery scenarios — e.g. if a prior buggy run or
+			// an operator restart caused one DC to get ahead of the others.
+			// In a clean rollout the leading DC always blocks before advancing,
+			// so the DCs naturally stay in lockstep and this branch is not
+			// reached. But if a DC *did* fall behind, blocking it here would
+			// deadlock: the ahead DC is done and will never "un-roll" the later
+			// rack. The directional check lets the lagging DC catch up:
+			//
+			//   - rolling rack is EARLIER than current → we are ahead → BLOCK
+			//   - rolling rack is LATER  than current → we are behind → PROCEED
+			//   - rolling rack is the SAME              → in sync     → PROCEED
+			if !force && rc.RackAwareRollRestartsEnabled() {
+				rollingRack, err := rc.CurrentlyRollingRackClusterWide()
+				if err != nil {
+					logger.Error(err, "error checking cross-DC rack rollout status")
+					return result.Error(err)
+				}
+				if rollingRack != "" && rollingRack != rackName {
+					rollingIdx := -1
+					for i, ri := range rc.desiredRackInformation {
+						if ri.RackName == rollingRack {
+							rollingIdx = i
+							break
+						}
+					}
+					if rollingIdx >= 0 && rollingIdx < idx {
+						logger.Info(
+							"rack-aware rollout: waiting for other DCs to finish earlier rack before advancing",
+							"currentRack", rackName,
+							"rollingRack", rollingRack)
+						return result.RequeueSoon(10)
+					}
+				}
+			}
 			logger.
 				WithValues("rackName", rackName).
 				Info("statefulset needs an update")

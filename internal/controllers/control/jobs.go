@@ -81,6 +81,12 @@ func (r *CassandraTaskReconciler) restartSts(taskConfig *TaskConfiguration, sts 
 			}
 		}
 	}
+	// Check if cross-DC rack rollout coordination is enabled
+	crossDCEnabled := false
+	if taskConfig.Datacenter.Annotations != nil {
+		crossDCEnabled = taskConfig.Datacenter.Annotations[cassapi.RackAwareRollRestartsAnnotation] == "true"
+	}
+
 	restartedPods := 0
 	for _, st := range sts {
 		if st.Spec.Template.Annotations == nil {
@@ -104,6 +110,51 @@ func (r *CassandraTaskReconciler) restartSts(taskConfig *TaskConfiguration, sts 
 			taskConfig.Completed = restartedPods
 			// This is still restarting
 			return ctrl.Result{RequeueAfter: JobRunningRequeue}, nil
+		}
+
+		// Cross-DC rack-aware rollout coordination.
+		//
+		// This only fires for STSes not yet annotated (i.e. not yet started
+		// rolling). Already-completed racks hit the `continue` above.
+		//
+		// We use a directional comparison: only block if the cluster-wide
+		// rolling rack appears EARLIER in the sorted STS list than ours.
+		// That means another DC is still catching up on a previous rack
+		// and we (the leading DC) must wait. If the rolling rack is later,
+		// we are the lagging DC and should proceed to catch up. This
+		// prevents deadlock in recovery scenarios where one DC got ahead
+		// (e.g. operator restart mid-rollout). In a clean rollout the
+		// leading DC always blocks before advancing, keeping DCs in
+		// lockstep naturally.
+		//
+		//   - rolling rack is EARLIER than current → we are ahead → BLOCK
+		//   - rolling rack is LATER  than current → we are behind → PROCEED
+		//   - rolling rack is the SAME              → in sync     → PROCEED
+		if crossDCEnabled {
+			rackName := st.Labels[cassapi.RackLabel]
+			rollingRack, err := r.currentlyRollingRackClusterWide(taskConfig.Context, taskConfig.Datacenter)
+			if err != nil {
+				return ctrl.Result{}, err
+			}
+			if rollingRack != "" && rollingRack != rackName {
+				rollingBefore := false
+				for _, s := range sts {
+					sRack := s.Labels[cassapi.RackLabel]
+					if sRack == rollingRack {
+						rollingBefore = true
+						break
+					}
+					if sRack == rackName {
+						break
+					}
+				}
+				if rollingBefore {
+					logger.Info("rack-aware rollout: waiting for other DCs to finish earlier rack before advancing",
+						"currentRack", rackName,
+						"rollingRack", rollingRack)
+					return ctrl.Result{RequeueAfter: JobRunningRequeue}, nil
+				}
+			}
 		}
 
 		if taskConfig.Arguments.Fast {
@@ -146,6 +197,40 @@ func (r *CassandraTaskReconciler) restartSts(taskConfig *TaskConfiguration, sts 
 
 	// We're done
 	return ctrl.Result{}, nil
+}
+
+// currentlyRollingRackClusterWide returns the rack name of a STS that is currently
+// mid-roll in the cluster, or empty string if none.
+func (r *CassandraTaskReconciler) currentlyRollingRackClusterWide(ctx context.Context, dc *cassapi.CassandraDatacenter) (string, error) {
+	var stsList appsv1.StatefulSetList
+	if err := r.List(ctx, &stsList,
+		client.InNamespace(dc.Namespace),
+		client.MatchingLabels(dc.GetClusterLabels()),
+	); err != nil {
+		return "", err
+	}
+
+	for _, sts := range stsList.Items {
+		if sts.Spec.Replicas != nil && *sts.Spec.Replicas == 0 {
+			continue
+		}
+
+		status := sts.Status
+
+		updatedReplicas := status.UpdatedReplicas
+		if status.CurrentRevision != status.UpdateRevision {
+			updatedReplicas = status.CurrentReplicas + status.UpdatedReplicas
+		}
+
+		if status.ObservedGeneration != sts.Generation ||
+			status.Replicas != status.ReadyReplicas ||
+			status.Replicas != updatedReplicas ||
+			status.Replicas != status.AvailableReplicas {
+			return sts.Labels[cassapi.RackLabel], nil
+		}
+	}
+
+	return "", nil
 }
 
 // UpgradeSSTables functionality

@@ -4162,3 +4162,185 @@ func TestCheckDcPodDisruptionBudget(t *testing.T) {
 	pdb = &policyv1.PodDisruptionBudget{}
 	require.NoError(rc.Client.Get(rc.Ctx, pdbName, pdb))
 }
+
+func TestRackAwareRollRestartsEnabled(t *testing.T) {
+	rc, _, cleanupMockScr := setupTest()
+	defer cleanupMockScr()
+
+	// No annotation — should be disabled
+	assert.False(t, rc.RackAwareRollRestartsEnabled())
+
+	// With annotation set to "true"
+	rc.Datacenter.Annotations = map[string]string{
+		api.RackAwareRollRestartsAnnotation: "true",
+	}
+	assert.True(t, rc.RackAwareRollRestartsEnabled())
+
+	// With annotation set to something else
+	rc.Datacenter.Annotations[api.RackAwareRollRestartsAnnotation] = "false"
+	assert.False(t, rc.RackAwareRollRestartsEnabled())
+}
+
+func TestCurrentlyRollingRackClusterWide(t *testing.T) {
+	rc, _, cleanupMockScr := setupTest()
+	defer cleanupMockScr()
+
+	rc.Datacenter.Spec.ClusterName = "test-cluster"
+
+	// Create STS for rack1 - mid-roll
+	replicas := int32(3)
+	rack1Sts := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-cluster-dc1-rack1-sts",
+			Namespace: "default",
+			Labels: map[string]string{
+				api.ClusterLabel:    api.CleanLabelValue("test-cluster"),
+				api.DatacenterLabel: "dc1",
+				api.RackLabel:       "rack1",
+			},
+		},
+		Spec: appsv1.StatefulSetSpec{
+			Replicas: &replicas,
+			Selector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{api.RackLabel: "rack1"},
+			},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{api.RackLabel: "rack1"}},
+				Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "c", Image: "img"}}},
+			},
+		},
+		Status: appsv1.StatefulSetStatus{
+			Replicas:           3,
+			ReadyReplicas:      2,
+			UpdatedReplicas:    2,
+			AvailableReplicas:  2,
+			ObservedGeneration: 1,
+		},
+	}
+	rack1Sts.Generation = 1
+	require.NoError(t, rc.Client.Create(rc.Ctx, rack1Sts))
+
+	// Create STS for rack2 - fully ready
+	rack2Sts := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-cluster-dc1-rack2-sts",
+			Namespace: "default",
+			Labels: map[string]string{
+				api.ClusterLabel:    api.CleanLabelValue("test-cluster"),
+				api.DatacenterLabel: "dc1",
+				api.RackLabel:       "rack2",
+			},
+		},
+		Spec: appsv1.StatefulSetSpec{
+			Replicas: &replicas,
+			Selector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{api.RackLabel: "rack2"},
+			},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{api.RackLabel: "rack2"}},
+				Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "c", Image: "img"}}},
+			},
+		},
+		Status: appsv1.StatefulSetStatus{
+			Replicas:           3,
+			ReadyReplicas:      3,
+			UpdatedReplicas:    3,
+			AvailableReplicas:  3,
+			ObservedGeneration: 1,
+		},
+	}
+	rack2Sts.Generation = 1
+	require.NoError(t, rc.Client.Create(rc.Ctx, rack2Sts))
+
+	// Should return rack1 as the currently rolling rack
+	rollingRack, err := rc.CurrentlyRollingRackClusterWide()
+	assert.NoError(t, err)
+	assert.Equal(t, "rack1", rollingRack)
+}
+
+func TestCurrentlyRollingRackClusterWide_NoneRolling(t *testing.T) {
+	rc, _, cleanupMockScr := setupTest()
+	defer cleanupMockScr()
+
+	rc.Datacenter.Spec.ClusterName = "test-cluster"
+
+	// All STS fully ready
+	replicas := int32(3)
+	sts := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-cluster-dc1-rack1-sts",
+			Namespace: "default",
+			Labels: map[string]string{
+				api.ClusterLabel:    api.CleanLabelValue("test-cluster"),
+				api.DatacenterLabel: "dc1",
+				api.RackLabel:       "rack1",
+			},
+		},
+		Spec: appsv1.StatefulSetSpec{
+			Replicas: &replicas,
+			Selector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{api.RackLabel: "rack1"},
+			},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{api.RackLabel: "rack1"}},
+				Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "c", Image: "img"}}},
+			},
+		},
+		Status: appsv1.StatefulSetStatus{
+			Replicas:           3,
+			ReadyReplicas:      3,
+			UpdatedReplicas:    3,
+			AvailableReplicas:  3,
+			ObservedGeneration: 1,
+		},
+	}
+	sts.Generation = 1
+	require.NoError(t, rc.Client.Create(rc.Ctx, sts))
+
+	rollingRack, err := rc.CurrentlyRollingRackClusterWide()
+	assert.NoError(t, err)
+	assert.Empty(t, rollingRack)
+}
+
+func TestCurrentlyRollingRackClusterWide_SkipsScaledDown(t *testing.T) {
+	rc, _, cleanupMockScr := setupTest()
+	defer cleanupMockScr()
+
+	rc.Datacenter.Spec.ClusterName = "test-cluster"
+
+	zero := int32(0)
+	sts := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-cluster-dc1-rack2-sts",
+			Namespace: "default",
+			Labels: map[string]string{
+				api.ClusterLabel:    api.CleanLabelValue("test-cluster"),
+				api.DatacenterLabel: "dc1",
+				api.RackLabel:       "rack2",
+			},
+		},
+		Spec: appsv1.StatefulSetSpec{
+			Replicas: &zero,
+			Selector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{api.RackLabel: "rack2"},
+			},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{api.RackLabel: "rack2"}},
+				Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "c", Image: "img"}}},
+			},
+		},
+		Status: appsv1.StatefulSetStatus{
+			Replicas:           0,
+			ReadyReplicas:      0,
+			UpdatedReplicas:    0,
+			AvailableReplicas:  0,
+			ObservedGeneration: 0,
+		},
+	}
+	sts.Generation = 1
+	require.NoError(t, rc.Client.Create(rc.Ctx, sts))
+
+	rollingRack, err := rc.CurrentlyRollingRackClusterWide()
+	assert.NoError(t, err)
+	assert.Empty(t, rollingRack)
+}

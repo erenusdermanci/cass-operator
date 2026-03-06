@@ -142,6 +142,52 @@ func (rc *ReconciliationContext) GetContext() context.Context {
 	return rc.Ctx
 }
 
+// RackAwareRollRestartsEnabled checks whether rack-aware roll restart coordination
+// is enabled via the RackAwareRollRestartsAnnotation on this datacenter.
+func (rc *ReconciliationContext) RackAwareRollRestartsEnabled() bool {
+	if rc.Datacenter.Annotations == nil {
+		return false
+	}
+	return rc.Datacenter.Annotations[api.RackAwareRollRestartsAnnotation] == "true"
+}
+
+// CurrentlyRollingRackClusterWide returns the name of a rack that is currently
+// mid-roll anywhere in the cluster, or empty string if no rack is rolling.
+// This is used for cross-DC rack-aware rollout coordination.
+func (rc *ReconciliationContext) CurrentlyRollingRackClusterWide() (string, error) {
+	var stsList appsv1.StatefulSetList
+	if err := rc.Client.List(rc.Ctx, &stsList,
+		client.InNamespace(rc.Datacenter.Namespace),
+		client.MatchingLabels(rc.Datacenter.GetClusterLabels()),
+	); err != nil {
+		return "", err
+	}
+
+	for _, sts := range stsList.Items {
+		if sts.Spec.Replicas != nil && *sts.Spec.Replicas == 0 {
+			continue // scaled down, skip
+		}
+
+		status := sts.Status
+
+		// Use canary-aware updatedReplicas calculation, matching the
+		// local check in CheckRackPodTemplateDetails.
+		updatedReplicas := status.UpdatedReplicas
+		if status.CurrentRevision != status.UpdateRevision {
+			updatedReplicas = status.CurrentReplicas + status.UpdatedReplicas
+		}
+
+		if status.ObservedGeneration != sts.Generation ||
+			status.Replicas != status.ReadyReplicas ||
+			status.Replicas != updatedReplicas ||
+			status.Replicas != status.AvailableReplicas {
+			return sts.Labels[api.RackLabel], nil
+		}
+	}
+
+	return "", nil
+}
+
 func (rc *ReconciliationContext) validateDatacenterNameConflicts() []error {
 	dc := rc.Datacenter
 	var errs []error
