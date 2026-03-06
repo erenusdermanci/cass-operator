@@ -51,6 +51,26 @@ const (
 	stateDecommissioning = "Decommissioning"
 )
 
+// EvictPod evicts a pod using the policy/v1 Eviction API to honor PDB constraints.
+// If the eviction is blocked by a PDB, it returns a requeue result instead of an error.
+func (rc *ReconciliationContext) EvictPod(pod *corev1.Pod) result.ReconcileResult {
+	eviction := &policyv1.Eviction{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      pod.Name,
+			Namespace: pod.Namespace,
+		},
+	}
+	err := rc.Client.SubResource("eviction").Create(rc.Ctx, pod, eviction)
+	if err != nil {
+		if errors.IsTooManyRequests(err) {
+			rc.ReqLogger.Info("eviction blocked by PDB, requeueing", "pod", pod.Name)
+			return result.RequeueSoon(5)
+		}
+		return result.Error(err)
+	}
+	return result.Done()
+}
+
 // CalculateRackInformation determine how many nodes per rack are needed
 func (rc *ReconciliationContext) CalculateRackInformation() error {
 	rc.ReqLogger.Info("reconcile_racks::calculateRackInformation")
@@ -748,13 +768,8 @@ func (rc *ReconciliationContext) CheckPodsReady(endpointData httphelper.CassMeta
 	}
 
 	// delete stuck nodes
-
-	deletedNode, err := rc.deleteStuckNodes()
-	if err != nil {
-		return result.Error(err)
-	}
-	if deletedNode {
-		return result.Done()
+	if res := rc.deleteStuckNodes(); res.Completed() {
+		return res
 	}
 
 	// get the nodes labelled as seeds before we start any nodes
@@ -1431,7 +1446,7 @@ func (rc *ReconciliationContext) isNodeStuckWithoutPVC(pod *corev1.Pod) bool {
 	return false
 }
 
-func (rc *ReconciliationContext) deleteStuckNodes() (bool, error) {
+func (rc *ReconciliationContext) deleteStuckNodes() result.ReconcileResult {
 	rc.ReqLogger.Info("reconcile_racks::deleteStuckNodes")
 	for _, pod := range rc.dcPods {
 		shouldDelete := false
@@ -1445,14 +1460,14 @@ func (rc *ReconciliationContext) deleteStuckNodes() (bool, error) {
 		}
 
 		if shouldDelete {
-			rc.ReqLogger.Info(fmt.Sprintf("Deleting stuck pod: %s. Reason: %s", pod.Name, reason))
+			rc.ReqLogger.Info(fmt.Sprintf("Evicting stuck pod: %s. Reason: %s", pod.Name, reason))
 			rc.Recorder.Eventf(rc.Datacenter, corev1.EventTypeWarning, events.DeletingStuckPod,
-				reason)
-			return true, rc.Client.Delete(rc.Ctx, pod)
+				"Evicting stuck pod %s: %s", pod.Name, reason)
+			return rc.EvictPod(pod)
 		}
 	}
 
-	return false, nil
+	return result.Continue()
 }
 
 // isClusterHealthy does a LOCAL_QUORUM query to the Cassandra pods and returns true if all the pods were able to
@@ -2028,10 +2043,11 @@ func (rc *ReconciliationContext) startCassandra(endpointData httphelper.CassMeta
 		}
 
 		if err != nil {
-			// Pod was unable to start. Most likely this is not a recoverable error, so lets kill the pod and
+			// Pod was unable to start. Most likely this is not a recoverable error, so let's evict the pod and
 			// try again.
-			if deleteErr := rc.Client.Delete(rc.Ctx, pod); deleteErr != nil {
-				rc.ReqLogger.Error(err, "Unable to delete the pod, pod has failed to start", "Pod", pod.Name)
+			evictResult := rc.EvictPod(pod)
+			if _, evictErr := evictResult.Output(); evictErr != nil {
+				rc.ReqLogger.Error(evictErr, "Unable to evict the pod, pod has failed to start", "Pod", pod.Name)
 			}
 			rc.Recorder.Eventf(rc.Datacenter, corev1.EventTypeWarning, events.StartingCassandra,
 				"Failed to start pod %s, deleting it", pod.Name)
@@ -2357,12 +2373,8 @@ func (rc *ReconciliationContext) CheckRollingRestart() result.ReconcileResult {
 				logger.Error(err, "error during drain during rolling restart",
 					"pod", pod.Name)
 			}
-			// get a fresh pod
-			err = rc.Client.Delete(rc.Ctx, pod)
-			if err != nil {
-				return result.Error(err)
-			}
-			return result.Done()
+			// get a fresh pod: evict the pod to honor PDB
+			return rc.EvictPod(pod)
 		}
 	}
 
