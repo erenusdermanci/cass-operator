@@ -87,6 +87,11 @@ const (
 	// EnableParallelCleanupWithinRackAnnotation speeds up post-scale-out cleanup by processing nodes in parallel within a rack.
 	EnableParallelCleanupWithinRackAnnotation = "cassandra.datastax.com/enable-parallel-cleanup-within-rack"
 
+	// RackAwareRollRestartsAnnotation enables rack-aware roll restart coordination.
+	// When set to "true" on a CassandraDatacenter, the operator ensures only one rack
+	// is disrupted at a time across all DCs in the same cluster.
+	RackAwareRollRestartsAnnotation = "cassandra.crto.in/rack-aware-roll-restarts"
+
 	AllowUpdateAlways AllowUpdateType = "always"
 	AllowUpdateOnce   AllowUpdateType = "once"
 

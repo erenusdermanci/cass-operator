@@ -142,6 +142,48 @@ func (rc *ReconciliationContext) GetContext() context.Context {
 	return rc.Ctx
 }
 
+// RackAwareRollRestartsEnabled checks whether rack-aware roll restart coordination
+// is enabled via the RackAwareRollRestartsAnnotation on this datacenter.
+func (rc *ReconciliationContext) RackAwareRollRestartsEnabled() bool {
+	if rc.Datacenter.Annotations == nil {
+		return false
+	}
+	return rc.Datacenter.Annotations[api.RackAwareRollRestartsAnnotation] == "true"
+}
+
+// IsOtherRackRollingClusterWide checks if any StatefulSet in the cluster belonging to a
+// different rack than rackName is currently mid-roll (not fully ready).
+// This is used for cross-DC rack-aware rollout coordination.
+func (rc *ReconciliationContext) IsOtherRackRollingClusterWide(rackName string) (bool, string, error) {
+	var stsList appsv1.StatefulSetList
+	if err := rc.Client.List(rc.Ctx, &stsList,
+		client.InNamespace(rc.Datacenter.Namespace),
+		client.MatchingLabels(rc.Datacenter.GetClusterLabels()),
+	); err != nil {
+		return false, "", err
+	}
+
+	for _, sts := range stsList.Items {
+		stsRack := sts.Labels[api.RackLabel]
+		if stsRack == rackName {
+			continue // same rack, skip
+		}
+		if sts.Spec.Replicas != nil && *sts.Spec.Replicas == 0 {
+			continue // scaled down, skip
+		}
+
+		status := sts.Status
+		if status.ObservedGeneration != sts.Generation ||
+			status.Replicas != status.ReadyReplicas ||
+			status.Replicas != status.UpdatedReplicas ||
+			status.Replicas != status.AvailableReplicas {
+			return true, stsRack, nil
+		}
+	}
+
+	return false, "", nil
+}
+
 func (rc *ReconciliationContext) validateDatacenterNameConflicts() []error {
 	dc := rc.Datacenter
 	var errs []error

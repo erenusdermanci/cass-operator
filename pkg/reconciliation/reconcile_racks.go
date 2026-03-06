@@ -494,6 +494,21 @@ func (rc *ReconciliationContext) CheckRackPodTemplateDetails(force bool, failedR
 			return result.Continue()
 		}
 
+		// Cross-DC rack-aware rollout: if enabled, check that no other rack
+		// in the cluster is currently mid-roll before updating this rack.
+		if !force && rc.RackAwareRollRestartsEnabled() {
+			if rolling, otherRack, err := rc.IsOtherRackRollingClusterWide(rackName); err != nil {
+				logger.Error(err, "error checking cross-DC rack rollout status")
+				return result.Error(err)
+			} else if rolling {
+				logger.Info(
+					"cross-DC rack rollout: waiting for other rack to finish rolling",
+					"waitingForRack", otherRack,
+					"currentRack", rackName)
+				return result.RequeueSoon(10)
+			}
+		}
+
 		if !utils.ResourcesHaveSameHash(statefulSet, desiredSts) && (force || rc.UpdateAllowed()) {
 			logger.
 				WithValues("rackName", rackName).

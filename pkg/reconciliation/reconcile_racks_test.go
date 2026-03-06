@@ -4162,3 +4162,235 @@ func TestCheckDcPodDisruptionBudget(t *testing.T) {
 	pdb = &policyv1.PodDisruptionBudget{}
 	require.NoError(rc.Client.Get(rc.Ctx, pdbName, pdb))
 }
+
+func TestRackAwareRollRestartsEnabled(t *testing.T) {
+	rc, _, cleanupMockScr := setupTest()
+	defer cleanupMockScr()
+
+	// No annotation — should be disabled
+	assert.False(t, rc.RackAwareRollRestartsEnabled())
+
+	// With annotation set to "true"
+	rc.Datacenter.Annotations = map[string]string{
+		api.RackAwareRollRestartsAnnotation: "true",
+	}
+	assert.True(t, rc.RackAwareRollRestartsEnabled())
+
+	// With annotation set to something else
+	rc.Datacenter.Annotations[api.RackAwareRollRestartsAnnotation] = "false"
+	assert.False(t, rc.RackAwareRollRestartsEnabled())
+}
+
+func TestIsOtherRackRollingClusterWide(t *testing.T) {
+	rc, _, cleanupMockScr := setupTest()
+	defer cleanupMockScr()
+
+	rc.Datacenter.Spec.ClusterName = "test-cluster"
+
+	// Create STS for rack1 - mid-roll
+	replicas := int32(3)
+	rack1Sts := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-cluster-dc1-rack1-sts",
+			Namespace: "default",
+			Labels: map[string]string{
+				api.ClusterLabel:    api.CleanLabelValue("test-cluster"),
+				api.DatacenterLabel: "dc1",
+				api.RackLabel:       "rack1",
+			},
+		},
+		Spec: appsv1.StatefulSetSpec{
+			Replicas: &replicas,
+			Selector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{api.RackLabel: "rack1"},
+			},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{api.RackLabel: "rack1"}},
+				Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "c", Image: "img"}}},
+			},
+		},
+		Status: appsv1.StatefulSetStatus{
+			Replicas:           3,
+			ReadyReplicas:      2,
+			UpdatedReplicas:    2,
+			AvailableReplicas:  2,
+			ObservedGeneration: 1,
+		},
+	}
+	rack1Sts.Generation = 1
+	require.NoError(t, rc.Client.Create(rc.Ctx, rack1Sts))
+
+	// Create STS for rack2 - fully ready
+	rack2Sts := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-cluster-dc1-rack2-sts",
+			Namespace: "default",
+			Labels: map[string]string{
+				api.ClusterLabel:    api.CleanLabelValue("test-cluster"),
+				api.DatacenterLabel: "dc1",
+				api.RackLabel:       "rack2",
+			},
+		},
+		Spec: appsv1.StatefulSetSpec{
+			Replicas: &replicas,
+			Selector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{api.RackLabel: "rack2"},
+			},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{api.RackLabel: "rack2"}},
+				Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "c", Image: "img"}}},
+			},
+		},
+		Status: appsv1.StatefulSetStatus{
+			Replicas:           3,
+			ReadyReplicas:      3,
+			UpdatedReplicas:    3,
+			AvailableReplicas:  3,
+			ObservedGeneration: 1,
+		},
+	}
+	rack2Sts.Generation = 1
+	require.NoError(t, rc.Client.Create(rc.Ctx, rack2Sts))
+
+	// From rack1's perspective: rack2 is fully ready, should NOT block
+	rolling, rackName, err := rc.IsOtherRackRollingClusterWide("rack1")
+	assert.NoError(t, err)
+	assert.False(t, rolling)
+	assert.Empty(t, rackName)
+
+	// From rack2's perspective: rack1 is mid-roll, SHOULD block
+	rolling, rackName, err = rc.IsOtherRackRollingClusterWide("rack2")
+	assert.NoError(t, err)
+	assert.True(t, rolling)
+	assert.Equal(t, "rack1", rackName)
+}
+
+func TestIsOtherRackRollingClusterWide_SkipsScaledDown(t *testing.T) {
+	rc, _, cleanupMockScr := setupTest()
+	defer cleanupMockScr()
+
+	rc.Datacenter.Spec.ClusterName = "test-cluster"
+
+	// Create a scaled-down STS for rack2 that would appear mid-roll
+	zero := int32(0)
+	rack2Sts := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-cluster-dc1-rack2-sts",
+			Namespace: "default",
+			Labels: map[string]string{
+				api.ClusterLabel:    api.CleanLabelValue("test-cluster"),
+				api.DatacenterLabel: "dc1",
+				api.RackLabel:       "rack2",
+			},
+		},
+		Spec: appsv1.StatefulSetSpec{
+			Replicas: &zero,
+			Selector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{api.RackLabel: "rack2"},
+			},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{api.RackLabel: "rack2"}},
+				Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "c", Image: "img"}}},
+			},
+		},
+		Status: appsv1.StatefulSetStatus{
+			Replicas:           0,
+			ReadyReplicas:      0,
+			UpdatedReplicas:    0,
+			AvailableReplicas:  0,
+			ObservedGeneration: 0,
+		},
+	}
+	rack2Sts.Generation = 1
+	require.NoError(t, rc.Client.Create(rc.Ctx, rack2Sts))
+
+	// Should not be blocked — rack2 is scaled down
+	rolling, _, err := rc.IsOtherRackRollingClusterWide("rack1")
+	assert.NoError(t, err)
+	assert.False(t, rolling)
+}
+
+func TestIsOtherRackRollingClusterWide_CrossDC(t *testing.T) {
+	rc, _, cleanupMockScr := setupTest()
+	defer cleanupMockScr()
+
+	rc.Datacenter.Spec.ClusterName = "test-cluster"
+
+	replicas := int32(3)
+
+	// Sibling DC's STS in rack2 is mid-roll
+	siblingRack2 := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-cluster-dc2-rack2-sts",
+			Namespace: "default",
+			Labels: map[string]string{
+				api.ClusterLabel:    api.CleanLabelValue("test-cluster"),
+				api.DatacenterLabel: "dc2",
+				api.RackLabel:       "rack2",
+			},
+		},
+		Spec: appsv1.StatefulSetSpec{
+			Replicas: &replicas,
+			Selector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{api.RackLabel: "rack2"},
+			},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{api.RackLabel: "rack2"}},
+				Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "c", Image: "img"}}},
+			},
+		},
+		Status: appsv1.StatefulSetStatus{
+			Replicas:           3,
+			ReadyReplicas:      1,
+			UpdatedReplicas:    1,
+			AvailableReplicas:  1,
+			ObservedGeneration: 1,
+		},
+	}
+	siblingRack2.Generation = 1
+	require.NoError(t, rc.Client.Create(rc.Ctx, siblingRack2))
+
+	// Sibling DC's STS in rack1 (same rack) is also mid-roll — should NOT block rack1
+	siblingRack1 := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-cluster-dc2-rack1-sts",
+			Namespace: "default",
+			Labels: map[string]string{
+				api.ClusterLabel:    api.CleanLabelValue("test-cluster"),
+				api.DatacenterLabel: "dc2",
+				api.RackLabel:       "rack1",
+			},
+		},
+		Spec: appsv1.StatefulSetSpec{
+			Replicas: &replicas,
+			Selector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{api.RackLabel: "rack1"},
+			},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{api.RackLabel: "rack1"}},
+				Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "c", Image: "img"}}},
+			},
+		},
+		Status: appsv1.StatefulSetStatus{
+			Replicas:           3,
+			ReadyReplicas:      2,
+			UpdatedReplicas:    2,
+			AvailableReplicas:  2,
+			ObservedGeneration: 1,
+		},
+	}
+	siblingRack1.Generation = 1
+	require.NoError(t, rc.Client.Create(rc.Ctx, siblingRack1))
+
+	// From rack1: should be blocked because dc2's rack2 is mid-roll
+	rolling, rackName, err := rc.IsOtherRackRollingClusterWide("rack1")
+	assert.NoError(t, err)
+	assert.True(t, rolling)
+	assert.Equal(t, "rack2", rackName)
+
+	// From rack2: should be blocked because dc2's rack1 is mid-roll
+	rolling, rackName, err = rc.IsOtherRackRollingClusterWide("rack2")
+	assert.NoError(t, err)
+	assert.True(t, rolling)
+	assert.Equal(t, "rack1", rackName)
+}

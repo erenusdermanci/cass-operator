@@ -81,6 +81,12 @@ func (r *CassandraTaskReconciler) restartSts(taskConfig *TaskConfiguration, sts 
 			}
 		}
 	}
+	// Check if cross-DC rack rollout coordination is enabled
+	crossDCEnabled := false
+	if taskConfig.Datacenter.Annotations != nil {
+		crossDCEnabled = taskConfig.Datacenter.Annotations[cassapi.RackAwareRollRestartsAnnotation] == "true"
+	}
+
 	restartedPods := 0
 	for _, st := range sts {
 		if st.Spec.Template.Annotations == nil {
@@ -104,6 +110,20 @@ func (r *CassandraTaskReconciler) restartSts(taskConfig *TaskConfiguration, sts 
 			taskConfig.Completed = restartedPods
 			// This is still restarting
 			return ctrl.Result{RequeueAfter: JobRunningRequeue}, nil
+		}
+
+		// About to annotate a new STS (start rolling a new rack).
+		// If cross-DC coordination is enabled, check that no other rack in the cluster is mid-roll.
+		if crossDCEnabled {
+			rackName := st.Labels[cassapi.RackLabel]
+			if rolling, otherRack, err := r.isOtherRackRollingClusterWide(taskConfig.Context, taskConfig.Datacenter, rackName); err != nil {
+				return ctrl.Result{}, err
+			} else if rolling {
+				logger.Info("cross-DC rack rollout: waiting for other rack to finish rolling",
+					"waitingForRack", otherRack,
+					"currentRack", rackName)
+				return ctrl.Result{RequeueAfter: JobRunningRequeue}, nil
+			}
 		}
 
 		if taskConfig.Arguments.Fast {
@@ -146,6 +166,37 @@ func (r *CassandraTaskReconciler) restartSts(taskConfig *TaskConfiguration, sts 
 
 	// We're done
 	return ctrl.Result{}, nil
+}
+
+// isOtherRackRollingClusterWide checks if any STS in the cluster for a different rack is mid-roll.
+func (r *CassandraTaskReconciler) isOtherRackRollingClusterWide(ctx context.Context, dc *cassapi.CassandraDatacenter, rackName string) (bool, string, error) {
+	var stsList appsv1.StatefulSetList
+	if err := r.List(ctx, &stsList,
+		client.InNamespace(dc.Namespace),
+		client.MatchingLabels(dc.GetClusterLabels()),
+	); err != nil {
+		return false, "", err
+	}
+
+	for _, sts := range stsList.Items {
+		stsRack := sts.Labels[cassapi.RackLabel]
+		if stsRack == rackName {
+			continue
+		}
+		if sts.Spec.Replicas != nil && *sts.Spec.Replicas == 0 {
+			continue
+		}
+
+		status := sts.Status
+		if status.ObservedGeneration != sts.Generation ||
+			status.Replicas != status.ReadyReplicas ||
+			status.Replicas != status.UpdatedReplicas ||
+			status.Replicas != status.AvailableReplicas {
+			return true, stsRack, nil
+		}
+	}
+
+	return false, "", nil
 }
 
 // UpgradeSSTables functionality
