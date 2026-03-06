@@ -51,6 +51,32 @@ const (
 	stateDecommissioning = "Decommissioning"
 )
 
+// EvictPod evicts a pod using the policy/v1 Eviction API to honor PDB constraints.
+func (rc *ReconciliationContext) EvictPod(pod *corev1.Pod) error {
+	eviction := &policyv1.Eviction{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      pod.Name,
+			Namespace: pod.Namespace,
+		},
+	}
+	err := rc.Client.SubResource("eviction").Create(rc.Ctx, pod, eviction)
+	if err != nil {
+		if errors.IsTooManyRequests(err) {
+			rc.ReqLogger.Info("eviction blocked by PDB", "pod", pod.Name)
+			msg := fmt.Sprintf("eviction of pod %s blocked by PDB", pod.Name)
+			rc.Recorder.Eventf(rc.Datacenter, corev1.EventTypeNormal, events.EvictionBudgetUnavailable, msg)
+		} else {
+			rc.ReqLogger.Error(err, "eviction failed unexpectedly", "pod", pod.Name)
+			msg := fmt.Sprintf("eviction of pod %s failed unexpectedly", pod.Name)
+			rc.Recorder.Eventf(rc.Datacenter, corev1.EventTypeWarning, events.EvictionFail, msg)
+		}
+
+		return err
+	}
+
+	return nil
+}
+
 // CalculateRackInformation determine how many nodes per rack are needed
 func (rc *ReconciliationContext) CalculateRackInformation() error {
 	rc.ReqLogger.Info("reconcile_racks::calculateRackInformation")
@@ -1448,7 +1474,8 @@ func (rc *ReconciliationContext) deleteStuckNodes() (bool, error) {
 			rc.ReqLogger.Info(fmt.Sprintf("Deleting stuck pod: %s. Reason: %s", pod.Name, reason))
 			rc.Recorder.Eventf(rc.Datacenter, corev1.EventTypeWarning, events.DeletingStuckPod,
 				reason)
-			return true, rc.Client.Delete(rc.Ctx, pod)
+			// CRITEO: Evict instead of delete to honor PDB
+			return true, rc.EvictPod(pod)
 		}
 	}
 
@@ -2030,7 +2057,8 @@ func (rc *ReconciliationContext) startCassandra(endpointData httphelper.CassMeta
 		if err != nil {
 			// Pod was unable to start. Most likely this is not a recoverable error, so lets kill the pod and
 			// try again.
-			if deleteErr := rc.Client.Delete(rc.Ctx, pod); deleteErr != nil {
+			// CRITEO: Evict instead of delete to honor PDB
+			if deleteErr := rc.EvictPod(pod); deleteErr != nil {
 				rc.ReqLogger.Error(err, "Unable to delete the pod, pod has failed to start", "Pod", pod.Name)
 			}
 			rc.Recorder.Eventf(rc.Datacenter, corev1.EventTypeWarning, events.StartingCassandra,
@@ -2358,7 +2386,8 @@ func (rc *ReconciliationContext) CheckRollingRestart() result.ReconcileResult {
 					"pod", pod.Name)
 			}
 			// get a fresh pod
-			err = rc.Client.Delete(rc.Ctx, pod)
+			// CRITEO: Evict instead of delete to honor PDB
+			err = rc.EvictPod(pod)
 			if err != nil {
 				return result.Error(err)
 			}
@@ -2643,6 +2672,7 @@ func (rc *ReconciliationContext) fixMissingPVC() (bool, error) {
 			rc.ReqLogger.Info(fmt.Sprintf("Deleting stuck pod: %s. Reason: %s", pod.Name, reason))
 			rc.Recorder.Eventf(rc.Datacenter, corev1.EventTypeWarning, events.DeletingStuckPod,
 				reason)
+			// CRITEO: No need to replace by eviction, no data loss risk
 			return true, rc.Client.Delete(rc.Ctx, pod)
 		}
 	}

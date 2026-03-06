@@ -2013,12 +2013,19 @@ func TestFailedStart(t *testing.T) {
 	mockClient := mocks.NewClient(t)
 	rc.Client = mockClient
 
+	subResClient := mockClient.Status().(*mocks.SubResourceClient)
+
 	done := make(chan struct{})
-	k8sMockClientDelete(mockClient, nil).Once().Run(func(mock.Arguments) { close(done) })
+	// EvictPod calls SubResource("eviction").Create(...) instead of Client.Delete(...)
+	subResClient.On("Create",
+		mock.MatchedBy(func(ctx context.Context) bool { return ctx != nil }),
+		mock.MatchedBy(func(obj client.Object) bool { return obj != nil }),
+		mock.MatchedBy(func(obj client.Object) bool { return obj != nil }),
+	).Return(nil).Once().Run(func(mock.Arguments) { close(done) })
 
 	// Patch labelStarting, lastNodeStarted..
 	k8sMockClientPatch(mockClient, nil).Once()
-	k8sMockClientStatusPatch(mockClient.Status().(*mocks.SubResourceClient), nil).Twice()
+	k8sMockClientStatusPatch(subResClient, nil).Twice()
 
 	res := &http.Response{
 		StatusCode: http.StatusInternalServerError,

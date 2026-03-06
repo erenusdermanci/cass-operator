@@ -36,6 +36,8 @@ const (
 	UnhealthyDatacenter               string = "UnhealthyDatacenter"
 	RecreatingStatefulSet             string = "RecreatingStatefulSet"
 	InvalidDatacenterSpec             string = "InvalidDatacenterSpec"
+	EvictionBudgetUnavailable         string = "EvictionBudgetUnavailable"
+	EvictionFail                      string = "EvictionFail"
 )
 
 type LoggingEventRecorder struct {
