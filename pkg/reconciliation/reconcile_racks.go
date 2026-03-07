@@ -2329,7 +2329,14 @@ func isServerReadyToStart(pod *corev1.Pod) bool {
 
 func didServerLoseReadiness(pod *corev1.Pod) bool {
 	if pod.Labels[api.CassNodeState] == stateStarted {
-		return !isServerReady(pod)
+		if !isServerReady(pod) {
+			// A pod that was deleted and recreated by the StatefulSet controller
+			// will briefly appear with a stale "Started" label from the cache
+			// while the actual new pod has "ReadyToStart" from the pod template.
+			// Don't treat this as a readiness loss — the management API won't even
+			// be running yet on a freshly recreated pod.
+			return isMgmtApiRunning(pod)
+		}
 	}
 	return false
 }

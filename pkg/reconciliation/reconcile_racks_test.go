@@ -1403,6 +1403,91 @@ func Test_isMgmtApiRunning(t *testing.T) {
 	}
 }
 
+func Test_didServerLoseReadiness(t *testing.T) {
+	// Pod that is Started and Ready — has not lost readiness
+	startedReadyPod := makeMockReadyStartedPod()
+	startedReadyPod.Status.ContainerStatuses[0].State.Running = &corev1.ContainerStateRunning{
+		StartedAt: metav1.Date(2019, time.July, 4, 12, 12, 12, 0, time.UTC),
+	}
+
+	// Pod that is Started, not Ready, and mgmt API is running (>10s) — genuine readiness loss
+	startedNotReadyMgmtRunning := &corev1.Pod{}
+	startedNotReadyMgmtRunning.Labels = map[string]string{api.CassNodeState: stateStarted}
+	startedNotReadyMgmtRunning.Status.ContainerStatuses = []corev1.ContainerStatus{{
+		Name:  "cassandra",
+		Ready: false,
+		State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{
+			StartedAt: metav1.Date(2019, time.July, 4, 12, 12, 12, 0, time.UTC),
+		}},
+	}}
+
+	// Pod that is Started, not Ready, and mgmt API is NOT running (<10s) — freshly recreated pod (cache race)
+	startedNotReadyFreshPod := &corev1.Pod{}
+	startedNotReadyFreshPod.Labels = map[string]string{api.CassNodeState: stateStarted}
+	startedNotReadyFreshPod.Status.ContainerStatuses = []corev1.ContainerStatus{{
+		Name:  "cassandra",
+		Ready: false,
+		State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{
+			StartedAt: metav1.Now(),
+		}},
+	}}
+
+	// Pod that is Started, not Ready, and container is not running at all — freshly recreated pod
+	startedNotReadyNotRunning := &corev1.Pod{}
+	startedNotReadyNotRunning.Labels = map[string]string{api.CassNodeState: stateStarted}
+	startedNotReadyNotRunning.Status.ContainerStatuses = []corev1.ContainerStatus{{
+		Name:  "cassandra",
+		Ready: false,
+	}}
+
+	// Pod that is ReadyToStart — not a readiness loss
+	readyToStartPod := &corev1.Pod{}
+	readyToStartPod.Labels = map[string]string{api.CassNodeState: stateReadyToStart}
+	readyToStartPod.Status.ContainerStatuses = []corev1.ContainerStatus{{
+		Name:  "cassandra",
+		Ready: false,
+	}}
+
+	tests := []struct {
+		name string
+		pod  *corev1.Pod
+		want bool
+	}{
+		{
+			name: "Started and Ready — no readiness loss",
+			pod:  startedReadyPod,
+			want: false,
+		},
+		{
+			name: "Started, not Ready, mgmt API running — genuine readiness loss",
+			pod:  startedNotReadyMgmtRunning,
+			want: true,
+		},
+		{
+			name: "Started, not Ready, freshly created (<10s) — cache race, not a real loss",
+			pod:  startedNotReadyFreshPod,
+			want: false,
+		},
+		{
+			name: "Started, not Ready, container not running — cache race, not a real loss",
+			pod:  startedNotReadyNotRunning,
+			want: false,
+		},
+		{
+			name: "ReadyToStart, not Ready — not a readiness loss",
+			pod:  readyToStartPod,
+			want: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := didServerLoseReadiness(tt.pod); got != tt.want {
+				t.Errorf("didServerLoseReadiness() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 func Test_shouldUpdateLabelsForRackResource(t *testing.T) {
 	clusterName := "cassandradatacenter-example-cluster"
 	dcName := "cassandradatacenter-example"
